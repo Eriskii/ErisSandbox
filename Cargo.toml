@@ -1,0 +1,24 @@
+[package]
+name = "erissandbox"
+version = "0.1.0"
+edition = "2024"
+description = "Rootless Linux sandboxes: copy-on-write filesystems, private namespaces, cgroup limits"
+
+[dependencies]
+anyhow = "1.0.104"
+futures-util = "0.3.34"
+libc = "0.2.189"
+nix = { version = "0.31.3", features = ["mount", "sched", "socket", "uio", "signal", "process", "fs", "hostname", "user", "poll", "resource"] }
+seccompiler = "0.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+
+[dev-dependencies]
+libtest-mimic = "0.8.2"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "sandbox"
+harness = false
