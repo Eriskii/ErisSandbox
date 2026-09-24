@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 const INLINE_LIMIT: usize = 48 * 1024;
-const MAX_FDS: usize = 4;
+const MAX_FDS: usize = 32;
 const MEMFD_MARKER: &[u8] = b"\0memfd";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -21,6 +21,9 @@ pub struct Setup {
     pub layers: Vec<LayerMount>,
     pub binds: Vec<BindMount>,
     pub hostname: String,
+    pub devices: Vec<PathBuf>,
+    /// Loopback ports to listen on; `Ready` carries the listeners in this order.
+    pub listen: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

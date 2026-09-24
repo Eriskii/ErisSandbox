@@ -39,6 +39,9 @@ pub struct SandboxSpec {
     /// Working directory for commands.
     pub cwd: String,
     pub env: Vec<(String, String)>,
+    /// Host device nodes available at the same path inside, such as GPU render nodes.
+    pub devices: Vec<PathBuf>,
+    pub forwards: Vec<Forward>,
 }
 
 impl SandboxSpec {
@@ -70,6 +73,14 @@ pub struct Bind {
     pub source: PathBuf,
     pub target: String,
     pub writable: bool,
+}
+
+/// Connections to `127.0.0.1:port` inside the sandbox reach the Unix socket `socket` on the
+/// host. The sandbox gets a service, such as a proxy, without any network of its own.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Forward {
+    pub port: u16,
+    pub socket: PathBuf,
 }
 
 /// Owns every sandbox under one state directory.
@@ -143,6 +154,15 @@ impl Sandboxes {
     /// Sandboxes with a running init.
     pub fn live_count(&self) -> usize {
         self.live.lock().unwrap().len()
+    }
+
+    /// Stops the sandbox if it is live, killing what runs in it, and deletes its filesystem.
+    pub async fn destroy(&self, id: &str) -> Result<()> {
+        let open = self.open.lock().unwrap().get(id).and_then(Weak::upgrade);
+        if let Some(sandbox) = open {
+            sandbox.shutdown(true).await;
+        }
+        self.remove(id)
     }
 
     /// Deletes a sandbox's filesystem. It must not be live.
@@ -299,9 +319,14 @@ impl Sandbox {
         live.send(&Request::Setup(setup), &[]).await?;
         let ready = live.setup.lock().unwrap().take().expect("setup receiver");
         match ready.await {
-            Ok(Reply::Ready) => Ok(live),
-            Ok(Reply::SetupFailed { error }) => bail!(error),
-            other => bail!("sandbox init failed: {other:?}"),
+            Ok((Reply::Ready, listeners)) if listeners.len() == self.spec.forwards.len() => {
+                for (listener, forward) in listeners.into_iter().zip(&self.spec.forwards) {
+                    live.forward(listener, forward.socket.clone())?;
+                }
+                Ok(live)
+            }
+            Ok((Reply::SetupFailed { error }, _)) => bail!(error),
+            other => bail!("sandbox init failed: {:?}", other.map(|(reply, _)| reply)),
         }
     }
 
@@ -340,6 +365,8 @@ impl Sandbox {
                 .map(|b| BindMount { source: b.source.clone(), target: b.target.clone(), writable: b.writable })
                 .collect(),
             hostname: if self.spec.hostname.is_empty() { self.id.clone() } else { self.spec.hostname.clone() },
+            devices: self.spec.devices.clone(),
+            listen: self.spec.forwards.iter().map(|f| f.port).collect(),
         })
     }
 
@@ -358,6 +385,7 @@ impl Sandbox {
 }
 
 type Pending = oneshot::Sender<(Reply, Vec<OwnedFd>)>;
+type SetupReply = oneshot::Receiver<(Reply, Vec<OwnedFd>)>;
 
 /// The supervisor end of a running init.
 struct Live {
@@ -366,12 +394,20 @@ struct Live {
     ids: AtomicU64,
     active: AtomicUsize,
     dead: AtomicBool,
-    setup: Mutex<Option<oneshot::Receiver<Reply>>>,
+    setup: Mutex<Option<SetupReply>>,
+    /// Accept loops of the sandbox's forwards, stopped with it.
+    forwards: Mutex<Vec<tokio::task::AbortHandle>>,
     pending: Mutex<HashMap<u64, Pending>>,
     exits: Mutex<HashMap<u64, oneshot::Sender<ExitStatus>>>,
     sandbox: Weak<Sandbox>,
     /// Handles may be dropped outside the runtime; idle timers still need one.
     runtime: tokio::runtime::Handle,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.stop_forwards();
+    }
 }
 
 /// Counts toward keeping a sandbox live; the last one dropped starts the idle timer.
@@ -397,6 +433,7 @@ impl Live {
             active: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
             setup: Mutex::new(Some(setup_rx)),
+            forwards: Mutex::default(),
             pending: Mutex::default(),
             exits: Mutex::default(),
             sandbox,
@@ -445,7 +482,26 @@ impl Live {
         rx.await.context("sandbox stopped")
     }
 
-    async fn read_replies(self: Arc<Self>, setup: oneshot::Sender<Reply>) {
+    /// Serves a listener init opened inside the sandbox by connecting each client to `socket`.
+    fn forward(&self, listener: OwnedFd, socket: PathBuf) -> Result<()> {
+        let listener = std::net::TcpListener::from(listener);
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let task = self.runtime.spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let socket = socket.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut service) = tokio::net::UnixStream::connect(&socket).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut service).await;
+                    }
+                });
+            }
+        });
+        self.forwards.lock().unwrap().push(task.abort_handle());
+        Ok(())
+    }
+
+    async fn read_replies(self: Arc<Self>, setup: oneshot::Sender<(Reply, Vec<OwnedFd>)>) {
         let mut setup = Some(setup);
         loop {
             let Ok(mut ready) = self.socket.readable().await else { break };
@@ -460,9 +516,9 @@ impl Live {
                         let _ = tx.send(ExitStatus { code, signal });
                     }
                 }
-                (reply @ (Reply::Ready | Reply::SetupFailed { .. }), _) => {
+                (reply @ (Reply::Ready | Reply::SetupFailed { .. }), fds) => {
                     if let Some(tx) = setup.take() {
-                        let _ = tx.send(reply);
+                        let _ = tx.send((reply, fds));
                     }
                 }
                 (reply, fds) => {
@@ -474,6 +530,7 @@ impl Live {
             }
         }
         self.dead.store(true, Ordering::Release);
+        self.stop_forwards();
         self.pending.lock().unwrap().clear();
         self.exits.lock().unwrap().clear();
         self.exited().await;
@@ -482,6 +539,12 @@ impl Live {
             if guard.as_ref().is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), Arc::as_ptr(&self))) {
                 sandbox.tear_down(&mut guard);
             }
+        }
+    }
+
+    fn stop_forwards(&self) {
+        for task in self.forwards.lock().unwrap().drain(..) {
+            task.abort();
         }
     }
 

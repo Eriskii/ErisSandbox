@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Fixture, block_on};
-use erissandbox::{Bind, Layer, Limits, Output};
+use erissandbox::{Bind, Forward, Layer, Limits, Output};
 use libtest_mimic::Failed;
 use std::fs;
 
@@ -25,6 +25,9 @@ fn main() {
         ("filesystem_persists_across_hibernation", filesystem_persists_across_hibernation),
         ("missing_working_directory_is_reported", missing_working_directory_is_reported),
         ("kill_stops_the_whole_command", kill_stops_the_whole_command),
+        ("forwarded_ports_reach_host_sockets", forwarded_ports_reach_host_sockets),
+        ("devices_are_passed_through", devices_are_passed_through),
+        ("destroy_stops_and_deletes_a_sandbox", destroy_stops_and_deletes_a_sandbox),
     ]);
 }
 
@@ -233,4 +236,51 @@ fn kill_stops_the_whole_command(f: &Fixture) -> Result<(), Failed> {
     check(status.signal == Some(libc::SIGKILL), format!("{status:?}"))?;
     check(started.elapsed().as_secs() < 5, "kill did not stop the command")?;
     check(sh(f, &sandbox, SLEEPERS).text() == "0\n", "pipeline members survived")
+}
+
+fn forwarded_ports_reach_host_sockets(f: &Fixture) -> Result<(), Failed> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let socket = f.host_dir("forward").join("service.sock");
+    let listener = block_on(async { tokio::net::UnixListener::bind(&socket) }).unwrap();
+    common::runtime().spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = write.write_all(format!("host saw {line}\n").as_bytes()).await;
+                }
+            });
+        }
+    });
+    let mut spec = f.spec();
+    spec.forwards.push(Forward { port: 3128, socket: socket.clone() });
+    let sandbox = f.sandbox("forward", spec);
+    let talk = "exec 3<>/dev/tcp/127.0.0.1/3128; echo hello >&3; head -n1 <&3";
+    check(sh(f, &sandbox, talk).text() == "host saw hello\n", "first connection")?;
+    check(block_on(sandbox.shutdown(false)), "idle shutdown refused")?;
+    check(sh(f, &sandbox, talk).text() == "host saw hello\n", "forward after hibernation")?;
+    let other = f.sandbox("no-forward", f.spec());
+    let closed = sh(f, &other, "(exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null && echo open || echo closed");
+    check(closed.text() == "closed\n", format!("{closed:?}"))
+}
+
+fn devices_are_passed_through(f: &Fixture) -> Result<(), Failed> {
+    let mut spec = f.spec();
+    spec.devices.push("/dev/fuse".into());
+    let sandbox = f.sandbox("devices", spec);
+    let out = sh(f, &sandbox, "stat -c '%F %t:%T' /dev/fuse; exec 3<>/dev/fuse && echo opened");
+    check(out.text() == "character special file a:e5\nopened\n", format!("{out:?}"))?;
+    let plain = f.sandbox("no-devices", f.spec());
+    check(sh(f, &plain, "test -e /dev/fuse || echo absent").text() == "absent\n", "device leaked")
+}
+
+fn destroy_stops_and_deletes_a_sandbox(f: &Fixture) -> Result<(), Failed> {
+    let sandbox = f.sandbox("destroy", f.spec());
+    sh(f, &sandbox, "echo data > /root/file; (sleep 300 &)");
+    check(sandbox.is_live(), "background process should keep it live")?;
+    block_on(f.sandboxes.destroy("destroy")).map_err(|e| e.to_string())?;
+    check(!sandbox.is_live(), "destroyed sandbox is live")?;
+    let again = f.sandbox("destroy", f.spec());
+    check(sh(f, &again, "cat /root/file 2>/dev/null || echo gone").text() == "gone\n", "filesystem survived")
 }

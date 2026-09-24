@@ -30,6 +30,8 @@ fn main() -> anyhow::Result<()> {
             hostname: "worker".into(),
             cwd: "/workspace".into(),
             env: erissandbox::SandboxSpec::default_env(),
+            devices: Vec::new(),
+            forwards: vec![erissandbox::Forward { port: 3128, socket: "/run/myapp/proxy.sock".into() }],
         };
         let sandbox = sandboxes.sandbox("worker-1", spec)?;
         let output = sandbox.run(&["sh".into(), "-c".into(), "cargo test".into()]).await?;
@@ -50,6 +52,14 @@ fn main() -> anyhow::Result<()> {
 - `Sandbox::shutdown(false)` stops an idle sandbox and refuses while processes run.
   `shutdown(true)` kills everything. An idle sandbox also hibernates by itself after
   `Sandboxes::idle_grace`.
+- `SandboxSpec::forwards` connect `127.0.0.1:<port>` inside the sandbox to a Unix socket on
+  the host, so a sandbox with no network can still reach a service you choose, such as an
+  HTTP proxy. The supervisor accepts on listeners the init opens in the sandbox's network
+  namespace; nothing extra runs inside.
+- `SandboxSpec::devices` are host device nodes available at the same path inside, such as
+  `/dev/dri/renderD128` for a GPU. Their host permissions still apply.
+- `Sandboxes::destroy(id)` stops a sandbox, killing what runs in it, and deletes its
+  filesystem.
 - `Sandbox::layer_upper(i)` is where writes to layer `i` accumulate, for callers that turn
   them into something (a diff, a commit).
 - `rootfs::import` unpacks an image tarball, such as `docker export` output, with ownership
@@ -68,8 +78,9 @@ becomes a sandbox's init instead.
 cgroup. The init:
 
 1. mounts the overlays and binds, then fresh `/proc`, read-only `/sys`, a read-only view of
-   its own cgroup, and a minimal `/dev`;
-2. calls `pivot_root`, which detaches the host filesystem entirely;
+   its own cgroup, and a minimal `/dev` with the spec's devices;
+2. calls `pivot_root`, which detaches the host filesystem entirely, then opens a listener on
+   its loopback for each forward, which the supervisor receives with the ready message;
 3. drops to Docker's capability set, sets no-new-privs, makes itself non-dumpable, and
    installs the seccomp filter;
 4. serves spawn, kill, open and shutdown requests over a `SOCK_SEQPACKET` socket, passing

@@ -60,6 +60,8 @@ impl Fixture {
             hostname: String::new(),
             cwd: "/root".into(),
             env: SandboxSpec::default_env(),
+            devices: Vec::new(),
+            forwards: Vec::new(),
         }
     }
 

@@ -43,8 +43,11 @@ fn serve(socket: BorrowedFd) -> Result<()> {
         bail!("expected setup");
     };
     build_root(&setup).context("building the sandbox root")?;
+    let listeners = setup.listen.iter().map(|&port| listen(port)).collect::<Result<Vec<_>>>()?;
     lock_down().context("dropping privileges")?;
-    proto::send(socket, &Reply::Ready, &[])?;
+    let fds: Vec<RawFd> = listeners.iter().map(AsRawFd::as_raw_fd).collect();
+    proto::send(socket, &Reply::Ready, &fds)?;
+    drop(listeners);
     Init::new(socket)?.run()
 }
 
@@ -116,6 +119,12 @@ fn build_root(setup: &Setup) -> Result<()> {
         bind_mount(root, bind)?;
     }
     system_mounts(root)?;
+    for device in &setup.devices {
+        let target = inside(root, &device.to_string_lossy());
+        make_dir(target.parent().unwrap_or(root))?;
+        fs::File::create(&target).with_context(|| format!("creating {}", target.display()))?;
+        mount(&device.to_string_lossy(), &target, None, libc::MS_BIND, None)?;
+    }
     pivot(root)?;
     nix::unistd::sethostname(&setup.hostname).context("sethostname")?;
     loopback_up().context("bringing up loopback")?;
@@ -218,6 +227,13 @@ fn pivot(root: &Path) -> Result<()> {
     check(unsafe { libc::umount2(dot.as_ptr(), libc::MNT_DETACH) }).context("detaching the old root")?;
     std::env::set_current_dir("/")?;
     Ok(())
+}
+
+/// A listening socket on the sandbox's own loopback, for the supervisor to accept on.
+fn listen(port: u16) -> Result<OwnedFd> {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("listening on port {port}"))?;
+    Ok(listener.into())
 }
 
 fn loopback_up() -> io::Result<()> {

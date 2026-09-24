@@ -16,4 +16,4 @@ pub use cgroup::Limits;
 pub use process::{
     DRAIN_GRACE, ExitStatus, KILLED, Killer, OpenMode, Output, Process, open_path, reap, set_nonblocking, wait_exited,
 };
-pub use sandbox::{Bind, Layer, Sandbox, SandboxSpec, Sandboxes};
+pub use sandbox::{Bind, Forward, Layer, Sandbox, SandboxSpec, Sandboxes};
