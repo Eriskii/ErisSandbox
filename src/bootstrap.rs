@@ -25,6 +25,15 @@ pub struct Host {
     pub(crate) cgroups: Arc<Cgroups>,
     /// This executable, opened before any sandbox exists so inits can be exec'd from it.
     pub(crate) exe: Arc<OwnedFd>,
+    outside: Arc<crate::outside::Outside>,
+}
+
+impl Host {
+    /// Starts a command outside the sandbox namespace: as the invoking user, with the host's
+    /// view of users and files, as if the program had never bootstrapped.
+    pub async fn spawn_outside(&self, command: crate::outside::OutsideCommand) -> Result<crate::Process> {
+        self.outside.spawn(command).await
+    }
 }
 
 pub fn bootstrap() -> Result<Host> {
@@ -33,7 +42,7 @@ pub fn bootstrap() -> Result<Host> {
     }
     let cgroups = Cgroups::claim().context("claiming a delegated cgroup subtree")?;
     let ids = SubordinateIds::current()?;
-    enter_namespace(&ids, &cgroups)?;
+    let outside = enter_namespace(&ids, &cgroups)?;
     // Each live sandbox holds a socket and a pidfd; thousands of them outgrow the usual 1024.
     let (_, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?;
     nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, hard, hard)?;
@@ -41,7 +50,11 @@ pub fn bootstrap() -> Result<Host> {
     // Keep the descriptor clear of the low numbers a sandbox init receives.
     // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we own.
     let exe = unsafe { OwnedFd::from_raw_fd(libc::fcntl(exe.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10)) };
-    Ok(Host { cgroups: Arc::new(cgroups), exe: Arc::new(exe) })
+    Ok(Host {
+        cgroups: Arc::new(cgroups),
+        exe: Arc::new(exe),
+        outside: Arc::new(crate::outside::Outside::new(outside)),
+    })
 }
 
 struct SubordinateIds {
@@ -82,15 +95,17 @@ extern "C" fn forward(signal: libc::c_int) {
     }
 }
 
-/// Returns in the child, inside the new namespaces. The parent never returns.
-fn enter_namespace(ids: &SubordinateIds, cgroups: &Cgroups) -> Result<()> {
+/// Returns in the child, inside the new namespaces, with its end of the channel to the
+/// parent. The parent never returns: it serves commands outside until the child exits.
+fn enter_namespace(ids: &SubordinateIds, cgroups: &Cgroups) -> Result<OwnedFd> {
     let (ready_read, ready_write) = nix::unistd::pipe()?;
     let (go_read, go_write) = nix::unistd::pipe()?;
+    let (supervisor_end, parent_end) = crate::outside::channel()?;
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: bootstrap runs before any other thread exists.
     match unsafe { nix::unistd::fork() }? {
         nix::unistd::ForkResult::Child => {
-            drop((ready_read, go_write));
+            drop((ready_read, go_write, parent_end));
             // SAFETY: plain syscalls in a single-threaded child.
             unsafe {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
@@ -113,10 +128,10 @@ fn enter_namespace(ids: &SubordinateIds, cgroups: &Cgroups) -> Result<()> {
                 nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
                 None::<&str>,
             )?;
-            Ok(())
+            Ok(supervisor_end)
         }
         nix::unistd::ForkResult::Parent { child } => {
-            drop((ready_write, go_read));
+            drop((ready_write, go_read, supervisor_end));
             CHILD.store(child.as_raw(), Ordering::Relaxed);
             for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
                 // SAFETY: installing an async-signal-safe forwarding handler.
@@ -129,12 +144,7 @@ fn enter_namespace(ids: &SubordinateIds, cgroups: &Cgroups) -> Result<()> {
                 let _ = nix::unistd::write(&go_write, b"g");
             }
             drop(go_write);
-            let status = loop {
-                match nix::sys::wait::waitpid(child, None) {
-                    Err(nix::errno::Errno::EINTR) => continue,
-                    other => break other,
-                }
-            };
+            let status = crate::outside::serve(parent_end, child.as_raw());
             cgroups.release();
             let code = match status {
                 Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,

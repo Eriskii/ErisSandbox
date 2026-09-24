@@ -7,12 +7,14 @@
 
 mod bootstrap;
 mod cgroup;
+mod outside;
 mod process;
 pub mod rootfs;
 mod sandbox;
 
 pub use bootstrap::{Host, bootstrap};
 pub use cgroup::Limits;
+pub use outside::OutsideCommand;
 pub use process::{
     DRAIN_GRACE, ExitStatus, KILLED, Killer, OpenMode, Output, Process, open_path, reap, set_nonblocking, wait_exited,
 };

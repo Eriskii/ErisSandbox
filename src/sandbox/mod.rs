@@ -5,7 +5,7 @@
 
 pub(crate) mod init;
 mod launch;
-mod proto;
+pub(crate) mod proto;
 mod seccomp;
 
 pub use crate::cgroup::Limits;

@@ -60,6 +60,10 @@ fn main() -> anyhow::Result<()> {
   `/dev/dri/renderD128` for a GPU. Their host permissions still apply.
 - `Sandboxes::destroy(id)` stops a sandbox, killing what runs in it, and deletes its
   filesystem.
+- `Host::spawn_outside(command)` runs a command outside the sandbox namespace: as the
+  invoking user, seeing users and files exactly as the host does, in a new session. Use it for
+  whatever should behave as if the program had never bootstrapped, such as a person's shell
+  (pass a pseudoterminal as `terminal`) or work meant to happen directly on the machine.
 - `Sandbox::layer_upper(i)` is where writes to layer `i` accumulate, for callers that turn
   them into something (a diff, a commit).
 - `rootfs::import` unpacks an image tarball, such as `docker export` output, with ownership
@@ -70,8 +74,10 @@ fn main() -> anyhow::Result<()> {
 **Bootstrap.** `bootstrap()` claims a delegated cgroup subtree and forks. The child becomes
 the *supervisor*: it continues `main` inside a new user and mount namespace, where the
 invoking user is root and the user's `/etc/subuid` range backs ids 1–65536 (through
-`newuidmap`). No root is needed. The parent only forwards signals, cleans up the cgroups, and
-exits with the supervisor's status. Re-executed with a private argument, the same binary
+`newuidmap`). No root is needed. The parent stays in the original namespaces: it forwards
+signals, starts commands outside on the supervisor's behalf (they are its children, and it
+reports their exits over a socket), cleans up the cgroups, and exits with the supervisor's
+status. When the supervisor exits, the parent kills the sessions it started. Re-executed with a private argument, the same binary
 becomes a sandbox's init instead.
 
 **Starting a sandbox.** The first request `clone3`s an init directly into its namespaces and

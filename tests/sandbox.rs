@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Fixture, block_on};
-use erissandbox::{Bind, Forward, Layer, Limits, Output};
+use erissandbox::{Bind, Forward, Layer, Limits, Output, OutsideCommand};
 use libtest_mimic::Failed;
 use std::fs;
 
@@ -28,6 +28,9 @@ fn main() {
         ("forwarded_ports_reach_host_sockets", forwarded_ports_reach_host_sockets),
         ("devices_are_passed_through", devices_are_passed_through),
         ("destroy_stops_and_deletes_a_sandbox", destroy_stops_and_deletes_a_sandbox),
+        ("outside_commands_run_as_the_invoking_user", outside_commands_run_as_the_invoking_user),
+        ("outside_commands_stop_with_their_process_group", outside_commands_stop_with_their_process_group),
+        ("outside_commands_can_own_a_terminal", outside_commands_can_own_a_terminal),
     ]);
 }
 
@@ -283,4 +286,79 @@ fn destroy_stops_and_deletes_a_sandbox(f: &Fixture) -> Result<(), Failed> {
     check(!sandbox.is_live(), "destroyed sandbox is live")?;
     let again = f.sandbox("destroy", f.spec());
     check(sh(f, &again, "cat /root/file 2>/dev/null || echo gone").text() == "gone\n", "filesystem survived")
+}
+
+fn outside(dir: &std::path::Path, script: &str) -> OutsideCommand {
+    OutsideCommand {
+        argv: vec!["sh".into(), "-c".into(), script.into()],
+        cwd: dir.to_owned(),
+        env: vec![("PATH".into(), std::env::var("PATH").unwrap()), ("MARK".into(), "set".into())],
+        terminal: None,
+    }
+}
+
+fn outside_commands_run_as_the_invoking_user(f: &Fixture) -> Result<(), Failed> {
+    let dir = f.host_dir("outside");
+    let inside = fs::read_to_string("/proc/self/uid_map").unwrap();
+    let mut bytes = Vec::new();
+    let status = block_on(async {
+        let process = f.host.spawn_outside(outside(&dir, "cat /proc/self/uid_map; echo $MARK; pwd; exit 7")).await?;
+        anyhow::Ok(process.drain(|chunk| bytes.extend_from_slice(chunk)).await)
+    })
+    .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    check(lines.len() == 3, format!("{text:?}"))?;
+    let map: Vec<&str> = lines[0].split_whitespace().collect();
+    check(map == ["0", "0", "4294967295"], format!("not the initial user namespace: {text:?}"))?;
+    check(inside.split_whitespace().nth(2) != Some("4294967295"), "the test itself runs outside")?;
+    check(lines[1] == "set" && lines[2] == dir.to_str().unwrap(), format!("{text:?}"))?;
+    check(status.code == Some(7), format!("{status:?}"))?;
+    let missing =
+        block_on(f.host.spawn_outside(OutsideCommand { argv: vec!["/no/such/program".into()], ..outside(&dir, "") }));
+    check(missing.is_err_and(|e| e.to_string().contains("/no/such/program")), "missing program was not reported")
+}
+
+fn outside_commands_stop_with_their_process_group(f: &Fixture) -> Result<(), Failed> {
+    let dir = f.host_dir("outside-kill");
+    let marker = format!("60.{}", std::process::id());
+    let script = format!("sleep {marker} | cat");
+    let started = std::time::Instant::now();
+    let status = block_on(async {
+        let mut command = outside(&dir, &script);
+        command.argv[0] = "bash".into();
+        let process = f.host.spawn_outside(command).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        process.kill().await;
+        anyhow::Ok(process.wait().await)
+    })
+    .map_err(|e| e.to_string())?;
+    check(status.signal == Some(libc::SIGKILL), format!("{status:?}"))?;
+    check(started.elapsed().as_secs() < 5, "kill did not stop it")?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let survivors = fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| fs::read(e.path().join("cmdline")).ok())
+        .filter(|c| String::from_utf8_lossy(c).contains(&marker))
+        .count();
+    check(survivors == 0, "the pipeline outlived the kill")
+}
+
+fn outside_commands_can_own_a_terminal(f: &Fixture) -> Result<(), Failed> {
+    use std::io::Read;
+    let dir = f.host_dir("outside-tty");
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let command = OutsideCommand { terminal: Some(pty.slave), ..outside(&dir, "tty; test -t 0 && echo interactive") };
+    let status = block_on(async {
+        let process = f.host.spawn_outside(command).await?;
+        anyhow::Ok(process.wait().await)
+    })
+    .map_err(|e| e.to_string())?;
+    let mut master = fs::File::from(pty.master);
+    let mut buffer = [0u8; 4096];
+    let read = master.read(&mut buffer).unwrap_or(0);
+    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+    check(status.success(), format!("{status:?}"))?;
+    check(text.starts_with("/dev/pts/") && text.contains("interactive"), format!("{text:?}"))
 }
