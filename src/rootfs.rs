@@ -14,13 +14,26 @@ pub fn import(mut tar: impl Read, dir: &Path) -> Result<()> {
         .args(["-x", "-p", "--numeric-owner", "--exclude=dev/*", "--exclude=.dockerenv", "-C"])
         .arg(dir)
         .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("running tar")?;
-    std::io::copy(&mut tar, child.stdin.as_mut().unwrap())?;
+    let mut stderr = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let copied = std::io::copy(&mut tar, child.stdin.as_mut().unwrap());
     drop(child.stdin.take());
     let status = child.wait()?;
+    let errors = errors.join().unwrap_or_default();
+    let tail: Vec<&str> = errors.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
     if !status.success() {
-        bail!("tar exited with {status}");
+        bail!("tar exited with {status}: {}", tail.join("\n"));
     }
-    Ok(())
+    match copied {
+        // tar stops reading at the end-of-archive marker, leaving the record's padding unread.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map(drop).with_context(|| format!("feeding tar: {}", tail.join("\n"))),
+    }
 }
