@@ -77,7 +77,8 @@ invoking user is root and the user's `/etc/subuid` range backs ids 1–65536 (th
 `newuidmap`). No root is needed. The parent stays in the original namespaces: it forwards
 signals, starts commands outside on the supervisor's behalf (they are its children, and it
 reports their exits over a socket), cleans up the cgroups, and exits with the supervisor's
-status. When the supervisor exits, the parent kills the sessions it started. Re-executed with a private argument, the same binary
+status. When the supervisor exits, the parent kills the sessions it started.
+Re-executed with a private argument, the same binary
 becomes a sandbox's init instead.
 
 **Starting a sandbox.** The first request `clone3`s an init directly into its namespaces and
