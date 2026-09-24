@@ -12,7 +12,7 @@ mod process;
 pub mod rootfs;
 mod sandbox;
 
-pub use bootstrap::{Host, bootstrap};
+pub use bootstrap::{Host, bootstrap, launched_pid};
 pub use cgroup::Limits;
 pub use outside::OutsideCommand;
 pub use process::{

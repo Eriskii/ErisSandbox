@@ -86,6 +86,16 @@ impl SubordinateIds {
 }
 
 static CHILD: AtomicI32 = AtomicI32::new(0);
+static LAUNCHED: AtomicI32 = AtomicI32::new(0);
+
+/// The process whoever started this program owns: the bootstrap parent once bootstrap has
+/// forked, this process otherwise.
+pub fn launched_pid() -> u32 {
+    match LAUNCHED.load(Ordering::Relaxed) {
+        0 => std::process::id(),
+        pid => pid as u32,
+    }
+}
 
 extern "C" fn forward(signal: libc::c_int) {
     let child = CHILD.load(Ordering::Relaxed);
@@ -105,6 +115,7 @@ fn enter_namespace(ids: &SubordinateIds, cgroups: &Cgroups) -> Result<OwnedFd> {
     // SAFETY: bootstrap runs before any other thread exists.
     match unsafe { nix::unistd::fork() }? {
         nix::unistd::ForkResult::Child => {
+            LAUNCHED.store(parent, Ordering::Relaxed);
             drop((ready_read, go_write, parent_end));
             // SAFETY: plain syscalls in a single-threaded child.
             unsafe {
