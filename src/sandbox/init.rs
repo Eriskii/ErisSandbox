@@ -91,9 +91,16 @@ fn overlay_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "\\\\").replace(',', "\\,").replace(':', "\\:")
 }
 
+/// `userxattr` keeps overlayfs's bookkeeping (whiteouts, opaque and moved directories) in
+/// `user.overlay.*` attributes, which a user namespace may write; the `trusted.*` ones it uses
+/// otherwise fail, and with them deleting or renaming anything from the image.
 fn overlay(lower: &Path, upper: &Path, work: &Path, target: &Path) -> Result<()> {
-    let options =
-        format!("lowerdir={},upperdir={},workdir={}", overlay_path(lower), overlay_path(upper), overlay_path(work));
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={},userxattr",
+        overlay_path(lower),
+        overlay_path(upper),
+        overlay_path(work)
+    );
     mount("overlay", target, Some("overlay"), 0, Some(&options))
 }
 

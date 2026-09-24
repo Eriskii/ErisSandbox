@@ -31,6 +31,7 @@ fn main() {
         ("outside_commands_run_as_the_invoking_user", outside_commands_run_as_the_invoking_user),
         ("outside_commands_stop_with_their_process_group", outside_commands_stop_with_their_process_group),
         ("outside_commands_can_own_a_terminal", outside_commands_can_own_a_terminal),
+        ("directories_can_be_renamed_like_on_any_filesystem", directories_can_be_renamed_like_on_any_filesystem),
     ]);
 }
 
@@ -361,4 +362,17 @@ fn outside_commands_can_own_a_terminal(f: &Fixture) -> Result<(), Failed> {
     let text = String::from_utf8_lossy(&buffer[..read]).to_string();
     check(status.success(), format!("{status:?}"))?;
     check(text.starts_with("/dev/pts/") && text.contains("interactive"), format!("{text:?}"))
+}
+
+/// Package managers install directories by renaming them into place, including over
+/// directories from the image.
+fn directories_can_be_renamed_like_on_any_filesystem(f: &Fixture) -> Result<(), Failed> {
+    let sandbox = f.sandbox("rename", f.spec());
+    let out = sh(
+        f,
+        &sandbox,
+        "mkdir -p /etc/fresh.new && touch /etc/fresh.new/a && mv /etc/fresh.new /etc/fresh && echo fresh; \
+         mv /etc/apt /etc/apt.moved && mv /etc/apt.moved /etc/apt && ls /etc/apt | head -1 && echo image",
+    );
+    check(out.text().starts_with("fresh\n") && out.text().ends_with("image\n"), format!("{out:?}"))
 }
